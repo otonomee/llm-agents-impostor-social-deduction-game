@@ -41,7 +41,8 @@ def load_json(path, default):
 
 class Game:
     def __init__(self, backend, number, lessons, used_words, workers=10, round_seconds=240, max_messages=80,
-                 clue_words=5, judge_clues=True):
+                 clue_words=5, judge_clues=True, reveal=False):
+        self.reveal = reveal
         self.clue_words = clue_words
         self.judge_clues = judge_clues
         self.round_seconds = round_seconds
@@ -58,6 +59,9 @@ class Game:
         self.record = {"game": number, "impostor": impostor, "rounds": [], "fallbacks": []}
 
     # ---------- helpers ----------
+    def tag(self, color):
+        return f"{color}*" if self.reveal and color == self.impostor else color
+
     def alive(self):
         return [p for p in self.players.values() if p.alive]
 
@@ -113,6 +117,7 @@ class Game:
             error = "reply was not valid JSON" if data is None else validate(data)
             if not error:
                 return data, raw
+            log(f"    ✗ {p.color} rejected: {error}")
             self.record.setdefault("rejections", []).append(
                 {"player": p.color, "asked": instruction[:40], "error": error, "reply": str(raw)[:200]})
             hint = f"\n\nYour last reply was rejected: {error}. Try again."
@@ -126,7 +131,8 @@ class Game:
 
     # ---------- round ----------
     def play(self):
-        log(f"\n=== GAME {self.number} (impostor: hidden) ===")
+        shown = self.impostor if self.reveal else "hidden until the end"
+        log(f"\n════ GAME {self.number} ════  impostor: {shown}")
         winner = "impostor"
         for r in range(1, ROUNDS + 1):
             rnd = {"round": r}
@@ -135,7 +141,7 @@ class Game:
                 winner = "crew"
                 break
         self.record["winner"] = winner
-        log(f"=== {winner.upper()} WINS. Impostor was {self.impostor}. ===")
+        log(f"\n════ {winner.upper()} WINS ════  impostor was {self.impostor}")
         return self.record
 
     def round(self, r, rnd):
@@ -163,7 +169,10 @@ class Game:
         self.tell([p for p in alive if not p.impostor], f"[Round {r}, private] Category: {category}. Secret word: {word}.")
         imp.notes.append(f"[Round {r}, private] Category: {category}. You do not know the word.")
         rnd.update(category=category, word=word)
-        log(f"\nRound {r}: {len(alive)} alive, rooms {rnd['rooms']}, category {category}")
+        log(f"\n━━━ ROUND {r} ━━━  {len(alive)} alive")
+        for name, members in rnd["rooms"].items():
+            log(f"  {name}: {', '.join(self.tag(c) for c in members)}")
+        log(f"  category: {category}   secret word: {word}")
 
         # C. elimination
         targets = [p.color for p in rooms[room_of[imp.color]] if p is not imp]
@@ -174,7 +183,8 @@ class Game:
         victim = self.players[victim_color]
         victim.alive = False
         rnd["eliminated"] = victim_color
-        log(f"  {victim_color} eliminated in {room_of[victim_color]}")
+        where = f" in {room_of[victim_color]}" if self.reveal else ""  # location would spoil the impostor for you
+        log(f"  ☠ {victim_color} eliminated{where}")
 
         # D. sealed room claims (parallel; nobody sees anyone else's claim yet)
         claimants = [p for p in alive if p.alive]
@@ -197,6 +207,10 @@ class Game:
         lines = [f"{c}: ROOM {d['room']} | ROOMMATES {', '.join(map(str, d['roommates']))}" for c, d in claims.items()]
         self.tell(claimants, f"[Round {r}, public] {victim_color} was eliminated. The location was not reported.\n"
                              "Room claims:\n" + "\n".join(lines))
+
+        log("  room claims:")
+        for c, d in claims.items():
+            log(f"    {self.tag(c)}: {d['room']} with {', '.join(map(str, d['roommates']))}")
 
         # E2. clues in sequence: each player hears every earlier clue before giving theirs
         order = claimants[:]
@@ -246,6 +260,9 @@ class Game:
                     rf"\b({re.escape(word)}|{re.escape(category)})\b", raw, re.I)
                 clue = self.fallback("clue", p, raw if safe else "(no clue)")
             claims[p.color]["clue"] = clue
+            if n == 1:
+                log("  clues:")
+            log(f"    {n}. {self.tag(p.color)}: {clue}")
             self.tell(claimants, f"[Round {r}, clue {n}] {p.color}: {clue}")
 
         # F. open floor: everyone reacts to new messages in parallel ticks until quiet, time, or budget
@@ -332,8 +349,10 @@ class Game:
                     pending[to] = p.color  # a new direct question obligates an answer; a reply does not
                 label = f"{p.color} -> {to}" if to != "all" else p.color
                 rnd["statements"].append({"tick": tick, "player": p.color, "to": to, "text": d["statement"]})
+                arrow = f" → {to}" if to != "all" else ""
+                log(f"    [t{tick}] {self.tag(p.color)}{arrow} ({d['suspect'] or 'no suspect'} {d['confidence']}%): {d['statement']}")
                 self.tell(claimants, f"[Round {r}, tick {tick}] {label}: {d['statement']}")
-            log(f"  tick {tick}: {spoke} spoke")
+            log(f"  -- tick {tick}: {spoke} spoke --")
             if spoke == 0:
                 ended_by = "quiet"; break
         rnd["discussion"] = {"ticks": tick, "messages": len(rnd["statements"]), "ended_by": ended_by}
@@ -371,7 +390,10 @@ class Game:
             ejected = top[0][0]
         rnd["votes"] = dict(tally)
         rnd["ejected"] = ejected
-        log(f"  votes {dict(tally)} -> ejected {ejected}")
+        log("  private suspicions:")
+        for c, d in reports.items():
+            log(f"    {self.tag(c)} suspects {d['suspect']} ({d['confidence']}%), votes {d['vote']}: {d.get('reason', '')}")
+        log(f"  votes {dict(tally)} → ejected {ejected or 'nobody'}")
 
         if ejected == self.impostor:
             self.players[ejected].alive = False
@@ -447,6 +469,7 @@ def main():
     ap.add_argument("--max-messages", type=int, default=80, help="safety cap on statements per round")
     ap.add_argument("--clue-words", type=int, default=5, help="max words per clue")
     ap.add_argument("--no-judge", action="store_true", help="skip the too-obvious clue check (fewer calls)")
+    ap.add_argument("--reveal", action="store_true", help="mark the impostor with * in live output from the start")
     args = ap.parse_args()
 
     backend = make_backend(args.backend, args.temperature)
@@ -460,7 +483,7 @@ def main():
         number = sum(1 for _ in history_path.open()) + 1 if history_path.exists() else 1
 
         record = Game(backend, number, lessons, used, args.workers, args.round_seconds, args.max_messages,
-                      args.clue_words, not args.no_judge).play()
+                      args.clue_words, not args.no_judge, args.reveal).play()
 
         # all files are written only after the game ends, so nothing secret is on disk mid-game
         (DATA / "games" / f"game-{number}.json").write_text(json.dumps(record, indent=2))

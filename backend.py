@@ -107,7 +107,9 @@ class OpencodeBackend:
         raise RuntimeError(f"opencode call failed 3 times: {last_error}")
 
     def _call(self, system, user):
-        sr = requests.post(f"{self.base}/session", json={}, auth=self.auth, timeout=REQUEST_TIMEOUT)
+        # a preset title keeps OpenCode from renaming the session; auto-titles can cost an extra model call
+        sr = requests.post(f"{self.base}/session", json={"title": "impostor-game"}, auth=self.auth,
+                           timeout=REQUEST_TIMEOUT)
         sr.raise_for_status()
         session_id = sr.json()["id"]
         try:
