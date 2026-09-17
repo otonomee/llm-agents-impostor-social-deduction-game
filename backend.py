@@ -197,6 +197,8 @@ class MockBackend:
                 ]
             elif key == "guess":
                 out[key] = random.choice(["sun", "cloud", "storm", "toaster", "violin", "rainbow", "hammer"])
+            elif key == "lessons":
+                out[key] = ["watch who echoes the earlier clues", "do not follow the first accusation blindly"]
             elif key == "statement":
                 out[key] = f"I think {out.get('suspect')} is acting strange." if out.get("suspect") else "Nothing new."
             else:

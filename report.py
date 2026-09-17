@@ -40,7 +40,8 @@ def transcript(n):
 
 
 def summary():
-    games = sorted(DATA.glob("games/game-*.json"), key=lambda p: int(p.stem.split("-")[1]))
+    games = sorted((p for p in DATA.glob("games/game-*.json") if "incomplete" not in p.stem),
+                   key=lambda p: int(p.stem.split("-")[1]))
     if not games:
         print("no games yet"); return
     wins = Counter()
