@@ -1,0 +1,27 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "player": {
+      "description": "Impostor game player. No tools.",
+      "temperature": 1.0,
+      "permission": {
+        "*": "deny",
+        "read": "deny",
+        "edit": "deny",
+        "glob": "deny",
+        "grep": "deny",
+        "list": "deny",
+        "bash": "deny",
+        "task": "deny",
+        "external_directory": "deny",
+        "todowrite": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "lsp": "deny",
+        "skill": "deny",
+        "question": "deny",
+        "doom_loop": "deny"
+      }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "kitchen appliances": ["toaster", "blender", "microwave", "kettle", "dishwasher", "refrigerator"],
+  "musical instruments": ["violin", "trumpet", "harmonica", "cello", "xylophone", "banjo"],
+  "animals": ["giraffe", "penguin", "octopus", "armadillo", "flamingo", "kangaroo"],
+  "sports": ["curling", "fencing", "surfing", "bowling", "archery", "lacrosse"],
+  "weather": ["hurricane", "fog", "hail", "drought", "blizzard", "rainbow"],
+  "vehicles": ["submarine", "tractor", "gondola", "motorcycle", "helicopter", "skateboard"],
+  "foods": ["lasagna", "sushi", "pretzel", "guacamole", "pancake", "burrito"],
+  "tools": ["hammer", "wrench", "chisel", "ladder", "flashlight", "screwdriver"],
+  "places": ["lighthouse", "casino", "library", "volcano", "airport", "aquarium"],
+  "clothing": ["poncho", "tuxedo", "sandals", "scarf", "overalls", "raincoat"]
+}
