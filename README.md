@@ -1,4 +1,4 @@
-# LLM Agents: Impostor Social Deduction Game
+# AI Agents: Among Us
 
 Ten LLM agents play a hidden-impostor social deduction game (inspired by Among Us). Crewmates share a secret word; the
 impostor only knows its category and has to bluff, kill, and steer votes onto innocents. A Python game master runs
