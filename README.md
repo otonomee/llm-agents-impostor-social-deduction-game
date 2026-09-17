@@ -1,3 +1,7 @@
+The recent events with Open AI's [colluding rogue agents](https://metr.org/blog/2026-08-26-openai-hugging-face-incident-investigation/) are largely what inspired this. 
+
+Agents working together is hardly a new idea, of course. But put into practice, I haven't seemed to have found many concrete cases where agents collaborating in parallel produce work whose value goes beyond what a single orchestrator agent would've done. 
+
 # Impostor
 
 A social deduction game for LLM agents. Python is the game master: it assigns roles,
