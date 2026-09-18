@@ -86,11 +86,22 @@ class OpencodeBackend:
         password = os.environ.get("OPENCODE_SERVER_PASSWORD")
         self.auth = (os.environ.get("OPENCODE_SERVER_USERNAME", "opencode"), password) if password else None
         try:
-            health = requests.get(f"{self.base}/global/health", auth=self.auth, timeout=10).json()
+            health = requests.get(f"{self.base}/global/health", auth=self.auth, timeout=30).json()
         except requests.RequestException as e:
             raise SystemExit(f"opencode server not reachable at {self.base}. Start it from the players folder: "
                              f"cd players && opencode serve --port 4096\n({e})")
-        agents = [a.get("name") for a in requests.get(f"{self.base}/agent", auth=self.auth, timeout=10).json()]
+        # the first /agent call can be slow while opencode loads providers and model catalogs
+        agents, last_error = [], None
+        for attempt in range(3):
+            try:
+                agents = [a.get("name") for a in
+                          requests.get(f"{self.base}/agent", auth=self.auth, timeout=90).json()]
+                break
+            except requests.RequestException as e:
+                last_error = e
+                time.sleep(2 ** attempt)
+        if not agents:
+            raise SystemExit(f"opencode is running but did not answer /agent: {last_error}")
         if self.agent not in agents:
             raise SystemExit(f"agent '{self.agent}' not found on the server. Run `opencode serve` from the players "
                              f"folder so it loads players/opencode.json. Agents found: {agents}")

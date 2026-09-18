@@ -13,14 +13,13 @@ import sys
 import textwrap
 import time
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from backend import make_backend
 
 COLORS = ["red", "blue", "green", "yellow", "purple", "orange", "pink", "black", "white", "brown"]
-ROOM_NAMES = ["Cafeteria", "Reactor", "Navigation", "Storage"]
 ROUNDS = 4
 DATA = Path(__file__).parent / "data"
 WORDS = json.loads((Path(__file__).parent / "words.json").read_text())
@@ -32,10 +31,12 @@ RETIRE_AFTER = 3  # an agent can be retired once it has played this many games
 SCORING = (
     "SCORING (points follow you across games):\n"
     "  crewmate: +2 for each vote you cast that ejects the impostor; +2 if you were the first to publicly accuse "
-    "the impostor in the round it was ejected; -1 for each vote you cast that ejects an innocent; -1 if you are "
-    "ejected while innocent; -2 each time you say the secret word out loud during discussion (it leaks the word to "
-    "the impostor); +3 to every crewmate, living or dead, if the crew wins.\n"
-    "  impostor: +1 for each round you survive; +1 for each innocent ejected; +6 if you win."
+    "the impostor in the round it was ejected; +1 for every round your private suspicion named the real impostor, "
+    "even if nobody listened; -1 for each vote you cast that ejects an innocent; -1 if you are ejected while "
+    "innocent; -2 each time you say the secret word out loud during discussion (it leaks the word to the impostor); "
+    "+3 to every crewmate, living or dead, if the crew wins.\n"
+    "  impostor: +2 for each round you survive; +2 for each innocent ejected; +8 if you win.\n"
+    "  everyone: -1 for any round you are alive and say nothing in the discussion. Silence is not a strategy here."
 )
 
 
@@ -124,14 +125,56 @@ class Player:
     notes: list = field(default_factory=list)
 
 
+TITLES = [  # worst first: an agent wears the worst title it has earned lately
+    ("caught", "Caught Red-Handed", "was ejected as the impostor"),
+    ("leak", "The Leaker", "said the secret word out loud"),
+    ("mob", "The Mob", "voted an innocent out"),
+    ("mute", "The Mute", "froze and the engine had to speak for it"),
+]
+
+
+def disgrace(game, pts):
+    """Who fumbled this game, in public. Everyone sees this in every future game."""
+    blunders = defaultdict(list)
+    imp = game.impostor
+    for rnd in game.record["rounds"]:
+        n = rnd["round"]
+        for c in rnd.get("leaks", []):
+            blunders[c].append(("leak", f"said the secret word out loud in R{n} of G{game.number}"))
+        ej = rnd.get("ejected")
+        if ej and ej != imp:
+            for voter, vote in rnd.get("votes_by", {}).items():
+                if voter != imp and vote == ej:
+                    blunders[voter].append(("mob", f"voted out innocent {ej} in R{n} of G{game.number}"))
+        if ej == imp:
+            blunders[imp].append(("caught", f"was ejected as the impostor in R{n} of G{game.number}"))
+    froze = Counter(f["player"] for f in game.record["fallbacks"])
+    for c, n in froze.items():
+        if n >= 2:
+            blunders[c].append(("mute", f"froze {n} times in G{game.number}; the engine spoke for it"))
+    worst_of = {}
+    for c, items in blunders.items():
+        agent = game.players[c].agent
+        kinds = {kind for kind, _ in items}
+        rank = min((i for i, (kind, _, _) in enumerate(TITLES) if kind in kinds), default=None)
+        if rank is not None:
+            kind, title, _ = TITLES[rank]
+            text = next(t for k, t in items if k == kind)
+            agent["title"], worst_of[c] = title, text
+            agent["shame"] = (agent.get("shame", []) + [f"{title}: {text}"])[-3:]
+        pts[c] -= min(2, sum(1 for kind, _ in items if kind == "mute"))
+    return worst_of
+
+
 # ───────────────────────────── game ─────────────────────────────
 class Game:
     def __init__(self, backend, number, lessons, used_words, roster, workers=10, round_seconds=240,
-                 max_messages=40, clue_words=5, judge_clues=True, say_words=25, retire=True):
+                 max_messages=40, clue_words=5, judge_clues=True, say_words=20, retire=True):
         self.backend, self.number, self.lessons, self.used_words = backend, number, lessons, used_words
         self.roster, self.workers, self.round_seconds, self.max_messages = roster, workers, round_seconds, max_messages
         self.clue_words, self.judge_clues, self.say_words, self.retire = clue_words, judge_clues, say_words, retire
         self.announced = {}
+        self.word = self.category = None
         seats = roster[:]
         random.shuffle(seats)
         impostor = random.choice(COLORS)
@@ -166,29 +209,40 @@ class Game:
             f"plays again, and a new agent takes its seat. Currently closest to retirement: {danger}.\n"
             f"Your journal, written by you in past games:\n{journal}\n\n{SCORING}"
         )
+        wall = "\n".join(
+            f"  {a['name']} — {a['shame'][-1]}"
+            for a in sorted(self.roster, key=lambda a: a["name"]) if a.get("shame"))
+        if wall:
+            stakes += ("\nTHE WALL (public, every player sees it; you are on it too if you fumbled):\n" + wall)
         rules = (
-            "THE GAME: 10 players named by color, one secretly the impostor. Each round: players are split into rooms "
-            "of 3+; crewmates learn a secret word, the impostor only its category; the impostor eliminates someone in "
-            "its own room (the location is not announced); everyone submits a sealed room claim (a room name and "
-            "roommates' colors), revealed together; then short clues about the word, one at a time, each player hearing "
-            "earlier clues (crewmate clues that make the word guessable alone are rejected); then an open floor where "
-            "everyone reacts to new messages at once, repeatedly, until it goes quiet, time runs out, or the message "
-            "limit is hit. If your suspicion changes you must say it; if someone addresses you, you must answer. Then "
-            "everyone privately names a suspect and votes. Most votes is ejected (tie or SKIP: nobody). The word is "
-            "revealed after each vote. The impostor wins by surviving the round 4 vote.\n"
-            f"Talk like a sharp, quick chat message: {self.say_words} words max, no preamble, no restating what "
-            "everyone already knows. Reply with JSON only."
+            "THE GAME: 10 players named by color, one secretly the impostor. One secret word is chosen for the whole "
+            "game. Crewmates are told it once, at the start; the impostor is told only its category and has to work "
+            "the word out from what everyone says. The word is never announced, not even between rounds.\n"
+            "Each round: the impostor eliminates any one player; then short clues about the word, one at a time, each "
+            "player hearing the clues before theirs (crewmate clues that make the word guessable alone are rejected); "
+            "then an open floor where everyone reacts to new messages at once, repeatedly, until it goes quiet, time "
+            "runs out, or the message limit is hit. If your suspicion changes you must say it; if someone addresses "
+            "you, you must answer. Then everyone privately names a suspect and votes. Most votes is ejected (tie or "
+            "SKIP: nobody). The impostor wins by surviving the round 4 vote.\n"
+            "PRESSING SOMEONE: put their color in the \"to\" field instead of \"all\". They are then required to answer "
+            "you on the next exchange. It is the only way to force an answer out of anyone.\n"
+            f"HOW TO TALK: like a text message between friends. Hard limit {self.say_words} words: anything past that "
+            "is cut off mid-sentence, so finish your point inside it. Blunt, specific, no "
+            "preamble, no restating what everyone already knows, no formal speeches. Name the player you mean.\n"
+            "HOW TO REPLY: output the JSON object and nothing else. No tool calls, no markdown, no explanation."
         )
         if p.impostor:
-            role = (f"YOUR ROLE: you are {p.color}, the IMPOSTOR. Lie about anything, including your room. Bluff clues "
-                    "that fit the ones before yours. Steer votes onto innocents. Never admit your role.")
+            role = (f"YOUR ROLE: you are {p.color}, the IMPOSTOR. You know the category, not the word. Every clue "
+                    "narrows it, and if a crewmate slips and says the word you have it for the rest of the game. Bluff "
+                    "clues that fit the ones before yours. Steer votes onto innocents. Never admit your role.")
         else:
             table = "\n".join(
                 f"  - {l['behavior']} ({l['type']}): pointed at the real impostor {l['correct']} of "
                 f"{l['correct'] + l['incorrect']} times (random guessing averages {l.get('expected', 0):.1f})"
                 for l in self.lessons) or "  none yet"
-            role = (f"YOUR ROLE: you are {p.color}, a crewmate. Report your room truthfully. Never say the secret word "
-                    "in discussion. Voting with the crowd onto an innocent costs you points, so think for yourself.\n"
+            role = (f"YOUR ROLE: you are {p.color}, a crewmate. Never say the secret word out loud: the impostor is "
+                    "listening for it all game and you only get one word. Voting with the crowd onto an innocent costs "
+                    "you points, so think for yourself.\n"
                     f"Shared crew signals from past games (above random = real tell):\n{table}")
         return f"{rules}\n\n{stakes}\n\n{role}"
 
@@ -246,80 +300,39 @@ class Game:
         alive = self.alive()
         rejections_before = len(self.record["rejections"])
 
-        # rooms
-        order = alive[:]
-        random.shuffle(order)
-        k = max(1, len(order) // 3)
-        rooms = {ROOM_NAMES[i]: order[i::k] for i in range(k)}
-        room_of = {}
-        for name, members in rooms.items():
-            for p in members:
-                room_of[p.color] = name
-                mates = ", ".join(m.color for m in members if m is not p)
-                p.notes.append(f"[Round {r}, private] You are in {name} with {mates}.")
-        rnd["rooms"] = {n: [p.color for p in m] for n, m in rooms.items()}
-
-        # secret word
-        category = random.choice(list(WORDS))
-        word = random.choice([w for w in WORDS[category] if w not in self.used_words] or WORDS[category])
-        self.used_words.append(word)
+        # the secret word is chosen once per game and stays secret until the game ends
+        if not self.word:
+            self.category = random.choice(list(WORDS))
+            self.word = random.choice([w for w in WORDS[self.category] if w not in self.used_words]
+                                      or WORDS[self.category])
+            self.used_words.append(self.word)
+            self.tell([p for p in alive if not p.impostor],
+                      f"[Game {self.number}, private] The secret word for this whole game is {self.word} "
+                      f"(category: {self.category}). It is never announced. Do not say it out loud.")
+            self.players[self.impostor].notes.append(
+                f"[Game {self.number}, private] Category: {self.category}. You do not know the word, and it will not "
+                "be revealed until the game ends. Work it out from the clues.")
+        category, word = self.category, self.word
         imp = self.players[self.impostor]
-        self.tell([p for p in alive if not p.impostor], f"[Round {r}, private] Category: {category}. Secret word: {word}.")
-        imp.notes.append(f"[Round {r}, private] Category: {category}. You do not know the word.")
         rnd.update(category=category, word=word)
         v.say()
         v.say(v.bold(f"━━━ ROUND {r}") + f" · {len(alive)} alive · {category} · word: {v.bold(word)} " + v.bold("━━━"))
-        if v.reveal:
-            v.say(v.dim("rooms   ") + "   ".join(f"{n}: {', '.join(v.p(c) for c in m)}" for n, m in rnd["rooms"].items()))
 
         # elimination
-        targets = [p.color for p in rooms[room_of[imp.color]] if p is not imp]
-        data, _ = self.ask(imp, "Choose one player in your room to eliminate.", '{"eliminate": "<color>"}',
+        targets = [p.color for p in alive if p is not imp]
+        data, _ = self.ask(imp, "Choose any living player to eliminate.", '{"eliminate": "<color>"}',
                            lambda d: None if d.get("eliminate") in targets else f"eliminate must be one of {targets}",
                            targets)
         victim_color = data["eliminate"] if data else self.fallback("elimination", imp, random.choice(targets))
         self.players[victim_color].alive = False
         rnd["eliminated"] = victim_color
-        where = f" in {room_of[victim_color]}" if v.reveal else ""
-        v.say(f"☠  {v.p(victim_color)} ({self.players[victim_color].agent['name']}) was eliminated{where}")
+        v.say(f"☠  {v.p(victim_color)} ({self.players[victim_color].agent['name']}) was eliminated")
 
-        # sealed room claims
         claimants = [p for p in alive if p.alive]
         others = lambda p: [c.color for c in claimants if c is not p] + [victim_color]
-        room_names = list(rooms)
-        player_colors = [c.color for c in claimants] + [victim_color]
-
-        def claim(p):
-            def check(d):
-                room = str(d.get("room", "")).strip()
-                match = next((n for n in room_names if n.lower() == room.lower()), None)
-                if not match:
-                    return f"room must be one of {room_names}, not a player color"
-                mates = d.get("roommates")
-                if not isinstance(mates, list) or any(str(m).lower() not in player_colors for m in mates):
-                    return f"roommates must be a list of player colors from {player_colors}"
-                d["room"] = match
-                d["roommates"] = [str(m).lower() for m in mates if str(m).lower() != p.color]
-                return None
-            data, _ = self.ask(p, f"Submit your sealed room claim. Rooms this round: {', '.join(room_names)}. "
-                                  "The room field must be a room name; roommates are player colors.",
-                               '{"room": "<room name>", "roommates": ["<color>"]}', check, others(p))
-            return p, data or self.fallback("room claim", p, {"room": "(no claim)", "roommates": []})
-
-        with ThreadPoolExecutor(self.workers) as ex:
-            claims = dict((p.color, d) for p, d in ex.map(claim, claimants))
-        rnd["claims"] = claims
-        lines = [f"{c}: ROOM {d['room']} | ROOMMATES {', '.join(map(str, d['roommates']))}" for c, d in claims.items()]
-        self.tell(claimants, f"[Round {r}, public] {victim_color} was eliminated. The location was not reported.\n"
-                             "Room claims:\n" + "\n".join(lines))
-        by_room = defaultdict(list)
-        for c, d in claims.items():
-            by_room[d["room"]].append(c)
-        v.say(v.dim("claims  ") + "   ".join(f"{room} ← {', '.join(v.p(c) for c in cs)}" for room, cs in by_room.items()))
-        if v.reveal:
-            lies = [c for c, d in claims.items() if d["room"] != room_of[c]]
-            if lies:
-                v.say(v.dim("        ") + "  ".join(f"⚠ {v.p(c)} lied (was in {room_of[c]})" for c in lies))
+        clues = {}
+        rnd["clues"] = clues
+        self.tell(claimants, f"[Round {r}, public] {victim_color} was eliminated.")
 
         # sequential clues
         order = claimants[:]
@@ -357,15 +370,17 @@ class Game:
                 if not p.impostor and too_obvious(clue):
                     return "too obvious: a judge named the secret word from that clue alone. Be subtler"
                 return None
-            data, last = self.ask(p, f"Give your clue ({self.clue_words} words max). No secret word, no category, "
-                                     "and not guessable on its own.", '{"clue": "<clue>"}', check_clue, others(p))
+            data, last = self.ask(p, f"Give your clue: {self.clue_words} words or fewer, like \"turns stubborn "
+                                     "bolts\". It must not contain the secret word or the category, and a judge will "
+                                     "reject it if the word is its top guess from your clue alone, so stay oblique.",
+                                  '{"clue": "..."}', check_clue, others(p))
             if data:
                 clue = str(data["clue"]).strip()
             else:
                 raw = str((last or {}).get("clue", "")).strip()
                 ok = raw and len(raw.split()) <= self.clue_words and not leak_re.search(raw)
                 clue = self.fallback("clue", p, raw if ok else "(no clue)")
-            claims[p.color]["clue"] = clue
+            clues[p.color] = clue
             clue_bits.append(f"{v.p(p.color)} \"{clue}\"")
             self.tell(claimants, f"[Round {r}, clue {n}] {p.color}: {clue}")
         v.wrap(v.dim("clues   "), " · ".join(clue_bits), 8)
@@ -407,11 +422,10 @@ class Game:
                         if asker:
                             return f"{asker} addressed you directly, so you must speak and answer"
                         return None
-                    text = str(d.get("statement", "")).strip()
+                    text = " ".join(str(d.get("statement", "")).split()[: self.say_words])
+                    d["statement"] = text  # long replies are trimmed, not rejected
                     if not text:
                         return "statement is required when speak is true"
-                    if len(text.split()) > self.say_words + 5:
-                        return f"too long: {self.say_words} words max"
                     if changed and s and not re.search(rf"\b{s}\b", text, re.I):
                         return f"your suspicion changed, so your statement must name {s}"
                     return None
@@ -432,39 +446,43 @@ class Game:
                                                             "to": asker or "all", "statement": msg})
                 return p, self.fallback("reaction", p, {"suspect": s, "confidence": conf, "speak": False})
 
-            with ThreadPoolExecutor(self.workers) as ex:
-                reactions = list(ex.map(react, claimants))
-            random.shuffle(reactions)
-
-            prev_pending, pending, spoke = pending, {}, 0
+            prev_pending, pending, spoke, changed_minds = pending, {}, 0, False
             if tick > 1:
                 v.say(v.dim("   ·"))
-            for p, d in reactions:
-                rnd["suspicion_timeline"].append({"tick": tick, "player": p.color, "suspect": d["suspect"],
-                                                  "confidence": d["confidence"], "spoke": bool(d.get("speak"))})
-                if not d.get("speak") or len(rnd["statements"]) >= self.max_messages:
-                    continue
-                spoke += 1
-                prev_s = self.announced.get(p.color, (None, 0))[0]
-                self.announced[p.color] = (d["suspect"], d["confidence"])
-                to = d.get("to", "all")
-                if to != "all" and prev_pending.get(p.color) != to:
-                    pending[to] = p.color
-                text = " ".join(str(d["statement"]).split()[: self.say_words + 5])
-                leaked = bool(word_re.search(text)) and not p.impostor
-                if leaked:
-                    rnd["leaks"].append(p.color)
-                rnd["statements"].append({"tick": tick, "player": p.color, "to": to, "text": text, "leak": leaked})
-                self.tell(claimants, f"[Round {r}, tick {tick}] {p.color}{' -> ' + to if to != 'all' else ''}: {text}")
-                head = f"   {v.p(p.color)}" + (f" → {v.p(to)}" if to != "all" else "") + ": "
-                tail = ""
-                if d["suspect"] and d["suspect"] != prev_s:
-                    tail += "  " + v.dim("[sus → ") + v.p(d["suspect"]) + v.dim("]")
-                if leaked:
-                    tail += "  💥 " + v.bold("leaked the word")
-                v.wrap(head, text + tail, 6)
+            with ThreadPoolExecutor(self.workers) as ex:
+                futures = [ex.submit(react, p) for p in claimants]
+                for future in as_completed(futures):   # whoever answers first speaks first
+                    p, d = future.result()
+                    rnd["suspicion_timeline"].append({"tick": tick, "player": p.color, "suspect": d["suspect"],
+                                                      "confidence": d["confidence"], "spoke": bool(d.get("speak"))})
+                    if not d.get("speak") or len(rnd["statements"]) >= self.max_messages:
+                        continue
+                    spoke += 1
+                    prev_s = self.announced.get(p.color, (None, 0))[0]
+                    self.announced[p.color] = (d["suspect"], d["confidence"])
+                    to = d.get("to", "all")
+                    if to != "all" and prev_pending.get(p.color) != to:
+                        pending[to] = p.color
+                    text = " ".join(str(d["statement"]).split()[: self.say_words])
+                    leaked = bool(word_re.search(text)) and not p.impostor
+                    if leaked:
+                        rnd["leaks"].append(p.color)
+                    rnd["statements"].append({"tick": tick, "player": p.color, "to": to, "text": text, "leak": leaked})
+                    self.tell(claimants, f"[Round {r}, tick {tick}] {p.color}{' -> ' + to if to != 'all' else ''}: {text}")
+                    head = f"   {v.p(p.color)}" + (f" → {v.p(to)}" if to != "all" else "") + ": "
+                    tail = ""
+                    if d["suspect"] != prev_s:
+                        changed_minds = True
+                        if d["suspect"]:
+                            tail += "  " + v.dim("[sus → ") + v.p(d["suspect"]) + v.dim("]")
+                    if leaked:
+                        tail += "  💥 " + v.bold("leaked the word")
+                    v.wrap(head, text + tail, 6)
             if spoke == 0:
                 ended_by = "quiet"; break
+            leader = Counter(self.announced.get(p.color, (None, 0))[0] for p in claimants).most_common(1)[0]
+            if tick >= 2 and leader[0] and leader[1] >= 0.8 * len(claimants) and not changed_minds:
+                ended_by = "consensus"; break
         rnd["discussion"] = {"ticks": tick, "messages": len(rnd["statements"]), "ended_by": ended_by}
 
         # heat: what everyone currently suspects out loud
@@ -518,7 +536,7 @@ class Game:
         if ejected:
             self.players[ejected].alive = False
         msg = f"{ejected} was ejected and was not the impostor." if ejected else "Nobody was ejected."
-        self.tell(self.alive(), f"[Round {r}, public] {msg} The secret word was: {word}.")
+        self.tell(self.alive(), f"[Round {r}, public] {msg}")
         return False
 
     # ---------- after the game ----------
@@ -540,7 +558,7 @@ class Game:
                         add(voter, 2 if ej == imp else -1,
                             f"{'ejected the impostor' if ej == imp else 'voted out innocent ' + ej} (R{rnd['round']})")
                 if ej != imp:
-                    add(imp, 1, f"{ej} ejected (R{rnd['round']})")
+                    add(imp, 2, f"{ej} ejected (R{rnd['round']})")
                     add(ej, -1, f"got ejected while innocent (R{rnd['round']})")
             if ej == imp:
                 first = next((t["player"] for t in rnd.get("suspicion_timeline", [])
@@ -548,13 +566,20 @@ class Game:
                 if first:
                     add(first, 2, f"first to call out the impostor (R{rnd['round']})")
             else:
-                add(imp, 1, f"survived R{rnd['round']}")
+                add(imp, 2, f"survived R{rnd['round']}")
+            for rep_ in rnd.get("reports", []):
+                if rep_["correct"]:
+                    add(rep_["player"], 1, f"read the impostor right in R{rnd['round']}")
+            spoke = {m["player"] for m in rnd.get("statements", []) if not m.get("fallback")}
+            for c in rnd.get("votes_by", {}):
+                if c not in spoke:
+                    add(c, -1, f"said nothing in R{rnd['round']}")
         if self.record["winner"] == "crew":
             for c in COLORS:
                 if c != imp:
                     add(c, 3, "crew win")
         else:
-            add(imp, 6, "impostor win")
+            add(imp, 8, "impostor win")
         self.record["scores"] = {c: {"agent": self.players[c].agent["name"], "points": pts[c], "why": why[c]}
                                  for c in COLORS}
         return pts, why
@@ -588,8 +613,8 @@ def update_lessons(backend, record, lessons):
     known = ", ".join(l["behavior"] for l in lessons) or "none"
     listing = "\n".join(f"{i}. {r['reason']}" for i, r in enumerate(reports))
     user = ("Label each suspicion reason below with a short behavior name (reuse an existing name when it fits) and a "
-            f"type: clue, room, or discussion.\nExisting behavior names: {known}\n\n{listing}\n\n"
-            'JSON: {"labels": [{"i": 0, "behavior": "<n>", "type": "<clue|room|discussion>"}]}')
+            f"type: clue or discussion.\nExisting behavior names: {known}\n\n{listing}\n\n"
+            'JSON: {"labels": [{"i": 0, "behavior": "<n>", "type": "<clue|discussion>"}]}')
     data = parse_json(backend.complete("You label game data. Reply with JSON only.", user, max_tokens=2000)) or {}
     by_name = {l["behavior"]: l for l in lessons}
     for label in data.get("labels", []) if isinstance(data, dict) else []:
@@ -607,6 +632,7 @@ def update_lessons(backend, record, lessons):
 def after_game(game, backend, roster, retire, workers):
     v = VIEW
     pts, why = game.score()
+    shamed = disgrace(game, pts)
     winner = game.record["winner"]
     debrief = game.debrief_text()
 
@@ -655,6 +681,11 @@ def after_game(game, backend, roster, retire, workers):
         dead.append({k: game.record["retired"][k] for k in ("name", "avg", "games", "last_words", "game")})
         (DATA / "graveyard.json").write_text(json.dumps(dead, indent=2))
 
+    if shamed:
+        v.say(v.bold("the wall"))
+        for c, text in shamed.items():
+            a = game.players[c].agent
+            v.say(f"   {v.p(c)} {a['name']} — {v.bold(a['title'])}: {text}")
     v.say(v.bold("standings"))
     for i, a in enumerate(standings(roster), 1):
         move = before.get(a["name"])
@@ -674,14 +705,14 @@ def main():
     ap.add_argument("--backend", default="mock", choices=["mock", "opencode", "lobster", "anthropic"])
     ap.add_argument("--games", type=int, default=1)
     ap.add_argument("--temperature", type=float, default=1.0)
-    ap.add_argument("--workers", type=int, default=10, help="parallel calls per tick, claims, votes, journals")
+    ap.add_argument("--workers", type=int, default=10, help="parallel calls per tick, clues, votes, journals")
     ap.add_argument("--round-seconds", type=int, default=240, help="discussion time limit per round")
     ap.add_argument("--max-messages", type=int, default=40, help="cap on discussion messages per round")
-    ap.add_argument("--say-words", type=int, default=25, help="max words per discussion message")
+    ap.add_argument("--say-words", type=int, default=20, help="max words per discussion message")
     ap.add_argument("--clue-words", type=int, default=5, help="max words per clue")
     ap.add_argument("--no-judge", action="store_true", help="skip the too-obvious clue check (fewer calls)")
     ap.add_argument("--no-retire", action="store_true", help="never retire agents")
-    ap.add_argument("--reveal", action="store_true", help="spectator mode: show the impostor, true rooms, and lies")
+    ap.add_argument("--reveal", action="store_true", help="spectator mode: mark the impostor with *")
     ap.add_argument("--verbose", action="store_true", help="also show rejected replies, fallbacks, private reasons")
     ap.add_argument("--no-color", action="store_true")
     args = ap.parse_args()

@@ -16,15 +16,15 @@ def transcript(n):
     print(f"GAME {n}   impostor: {g['impostor']}   winner: {g['winner']}")
     for r in g["rounds"]:
         print(f"\n--- ROUND {r['round']} ---")
-        print(f"rooms: {r['rooms']}")
         print(f"category: {r['category']}   secret word: {r['word']}")
-        print(f"eliminated: {r['eliminated']} (location hidden from players)")
+        print(f"eliminated: {r['eliminated']}")
         if r.get("clue_order"):
             print(f"clue order: {' -> '.join(r['clue_order'])}")
-        print("claims:")
-        for c, d in r.get("claims", {}).items():
+        print("clues:")
+        clues = r.get("clues") or {c: d.get("clue", "") for c, d in r.get("claims", {}).items()}  # older games
+        for c in r.get("clue_order", list(clues)):
             tag = "  <-- IMPOSTOR" if c == g["impostor"] else ""
-            print(f"  {c:7} room {d['room']:10} with {', '.join(map(str, d['roommates'])):20} clue: {d.get('clue', '')}{tag}")
+            print(f"  {c:7} {clues.get(c, '')}{tag}")
         disc = r.get("discussion", {})
         print(f"discussion: {disc.get('messages', 0)} messages over {disc.get('ticks', 0)} ticks, ended by {disc.get('ended_by')}")
         for s in r.get("statements", []):

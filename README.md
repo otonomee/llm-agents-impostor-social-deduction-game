@@ -7,7 +7,7 @@ only ever knows what the engine tells it.
 
 ## How a round works
 1. Rooms are assigned privately. Crewmates get the secret word; the impostor gets only the category.
-2. The impostor eliminates someone in its room. Everyone learns who died, not where.
+2. The impostor eliminates any one player, anywhere in the map. Everyone learns who died, not where.
 3. Sealed room claims (room name + roommates), revealed all at once. The impostor may lie.
 4. Clues, one at a time, each player hearing the ones before. The impostor never goes first. A neutral judge
    rejects crew clues that give the word away on their own.
